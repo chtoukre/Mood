@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.service.name }}
+  labels: { app: ssm-proxy }
+spec:
+  type: {{ .Values.service.type }}
+  selector: { app: ssm-proxy }
+  ports:
+    - name: pg
+      port: {{ .Values.service.port }}
+      targetPort: {{ .Values.localPort }}
+

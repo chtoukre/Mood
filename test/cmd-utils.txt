@@ -1,0 +1,80 @@
+# Mood tracker
+ping -c 2 $(terraform output -raw db_endpoint)
+
+
+
+aws secretsmanager create-secret \
+  --name rds-postgres-password \
+  --secret-string "TonMotDePasse123!" \
+  --description "Mot de passe PostgreSQL RDS"
+
+
+aws secretsmanager get-secret-value \
+  --secret-id rds-postgres-password \
+  --query SecretString \
+  --output text
+
+
+aws ssm start-session \
+  --target $(terraform output -raw bastion_instance_id) \
+  --document-name AWS-StartPortForwardingSessionToRemoteHost \
+  --parameters '{"host":["'$(terraform output -raw db_endpoint)'"],"portNumber":["5432"],"localPortNumber":["5432"]}'
+
+
+kubectl apply -f k8s/postgres-deployment.yaml
+kubectl apply -f k8s/postgres-service.yaml
+kubectl port-forward service/postgres 5432:5432
+
+pip3 install psycopg2-binary
+
+
+psql -h localhost -p 5432 -U mooduser -d moodtracker
+SELECT * FROM mood_entries;
+
+
+CREATE TABLE mood_entries (
+    date DATE PRIMARY KEY,
+    moral_global INTEGER,
+    gratitude INTEGER,
+    pleine_conscience INTEGER,
+    famille INTEGER,
+    amis INTEGER,
+    relation INTEGER,
+    plaisir INTEGER,
+    calme INTEGER,
+    sincerite INTEGER,
+    temps_pour_soi INTEGER,
+    alimentation INTEGER,
+    hydratation INTEGER,
+    exercice INTEGER,
+    sorties INTEGER,
+    sante INTEGER,
+    creativite INTEGER,
+    finances INTEGER,
+    education_travail INTEGER,
+    emotions_pensees INTEGER,
+    present INTEGER,
+    futur INTEGER,
+    overall_mood INTEGER,
+    note TEXT
+);
+
+SELECT
+    date,
+    (
+        (
+            gratitude + pleine_conscience + famille + amis +
+            relation + plaisir + calme + sincerite + temps_pour_soi +
+            alimentation + hydratation + exercice + sorties + sante +
+            creativite + finances + education_travail +
+            emotions_pensees + present + futur
+        ) / 20.0
+    ) AS moyenne_autres_aspects
+FROM mood_entries
+ORDER BY date ASC;
+
+
+kubectl apply -f k8s/grafana-deployment.yaml
+kubectl apply -f k8s/grafana-service.yaml
+minikube service grafana
+

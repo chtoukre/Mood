@@ -5,6 +5,8 @@
 .terraform.lock.hcl
 */terraform.tfstate
 */terraform.tfstate.backup
+*/terraform.tfstate.*
 */.terraform/
-
-
+/data
+.venv
+*.pem

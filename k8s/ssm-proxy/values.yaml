@@ -1,0 +1,27 @@
+aws:
+  region: eu-west-3
+  accessKeyId: ""
+  secretAccessKey: ""
+  sessionToken: ""
+
+bastionId: ""        # rempli via --set
+rds:
+  endpoint: ""       # rempli via --set
+  remotePort: 5432
+localPort: 5432
+
+image:
+  name: debian
+  tag: stable-slim
+  pullPolicy: IfNotPresent
+
+resources: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+service:
+  name: postgres-rds
+  type: ClusterIP
+  port: 5432
+

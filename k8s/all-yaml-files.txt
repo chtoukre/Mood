@@ -1,0 +1,392 @@
+
+===============================
+File: ./grafana-service.yaml
+===============================
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+spec:
+  type: NodePort
+  selector:
+    app: grafana
+  ports:
+    - protocol: TCP
+      port: 3000
+      targetPort: 3000
+      nodePort: 32000  # Accès via http://localhost:32000
+
+-e 
+
+
+===============================
+File: ./grafana-deployment.yaml
+===============================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grafana
+  template:
+    metadata:
+      labels:
+        app: grafana
+    spec:
+      containers:
+        - name: grafana
+          image: grafana/grafana:10.4.0
+          ports:
+            - containerPort: 3000
+          env:
+            - name: GF_SECURITY_ADMIN_USER
+              value: "admin"
+            - name: GF_SECURITY_ADMIN_PASSWORD
+              value: "admin"
+            - name: GF_DATABASE_TYPE
+              value: "postgres"
+            - name: GF_DATABASE_HOST
+              value: "grafana-postgres:5432"     # ou l'adresse IP du service PostgreSQL
+            - name: GF_DATABASE_NAME
+              value: "grafana"
+            - name: GF_DATABASE_USER
+              value: "grafana"
+            - name: GF_DATABASE_PASSWORD
+              value: "grafana_pass"
+            - name: GF_DATABASE_SSL_MODE
+              value: "disable"
+
+
+-e 
+
+
+===============================
+File: ./postgres-moodtracker/postgres-deployment.yaml
+===============================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:15
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              value: "moodtracker"
+            - name: POSTGRES_USER
+              value: "mooduser"
+            - name: POSTGRES_PASSWORD
+              value: "moodpass"
+          volumeMounts:
+            - mountPath: /var/lib/postgresql/data
+              name: postgres-storage
+      volumes:
+        - name: postgres-storage
+          persistentVolumeClaim:
+            claimName: postgres-pvc
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+-e 
+
+
+===============================
+File: ./postgres-moodtracker/postgres-service.yaml
+===============================
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+spec:
+  type: ClusterIP
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+
+-e 
+
+
+===============================
+File: ./ssm-proxy/Chart.yaml
+===============================
+apiVersion: v2
+name: ssm-proxy
+description: SSM port-forwarding proxy to reach AWS RDS from inside K8s
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+
+-e 
+
+
+===============================
+File: ./ssm-proxy/templates/secret-aws.yaml
+===============================
+apiVersion: v1
+kind: Secret
+metadata:
+  name: aws-creds
+type: Opaque
+stringData:
+  AWS_ACCESS_KEY_ID: {{ .Values.aws.accessKeyId | quote }}
+  AWS_SECRET_ACCESS_KEY: {{ .Values.aws.secretAccessKey | quote }}
+  AWS_SESSION_TOKEN: {{ .Values.aws.sessionToken | default "" | quote }}
+
+-e 
+
+
+===============================
+File: ./ssm-proxy/templates/deployment.yaml
+===============================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ssm-proxy
+  labels: { app: ssm-proxy }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: ssm-proxy }
+  template:
+    metadata:
+      labels: { app: ssm-proxy }
+    spec:
+      containers:
+        # 1) Tunnel SSM -> 127.0.0.1:15432
+        - name: ssm-tunnel
+          image: debian:stable-slim
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - secretRef: { name: aws-creds }
+            - configMapRef: { name: ssm-proxy-config }
+          command: ["/bin/sh","-c"]
+          args:
+            - |
+              set -e
+              apt-get update
+              apt-get install -y --no-install-recommends curl unzip ca-certificates groff less python3 python3-pip netcat-openbsd
+              python3 -m pip install --break-system-packages awscli
+              # Plugin SSM ARM64 (Minikube sur Mac M1/M2)
+              curl -fsSL "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_arm64/session-manager-plugin.deb" -o /tmp/ssm.deb
+              dpkg -i /tmp/ssm.deb || apt-get -f install -y
+              echo "🔐 Region=$AWS_REGION | 🎯 Bastion=$BASTION_INSTANCE_ID | 🗄 RDS=$RDS_ENDPOINT"
+              # Tunnel SSM -> 127.0.0.1:15432 (loopback)
+              while true; do
+                aws ssm start-session \
+                  --region "$AWS_REGION" \
+                  --target "$BASTION_INSTANCE_ID" \
+                  --document-name AWS-StartPortForwardingSessionToRemoteHost \
+                  --parameters "{\"host\":[\"$RDS_ENDPOINT\"],\"portNumber\":[\"5432\"],\"localPortNumber\":[\"15432\"]}" || true
+                echo "SSM tunnel ended. Reconnecting in 3s..."
+                sleep 3
+              done
+          readinessProbe:
+            exec:
+              command: [ "sh","-c","nc -z 127.0.0.1 15432" ]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 60
+          livenessProbe:
+            exec:
+              command: [ "sh","-c","nc -z 127.0.0.1 15432" ]
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            failureThreshold: 6
+
+        # 2) Sidecar socat -> expose 0.0.0.0:5432 vers 127.0.0.1:15432
+        - name: socat
+          image: alpine/socat:1.8.0.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - "-d"
+            - "-d"
+            - "TCP-LISTEN:5432,reuseaddr,fork,bind=0.0.0.0"
+            - "TCP:127.0.0.1:15432"
+          ports:
+            - name: pg
+              containerPort: 5432
+          readinessProbe:
+            exec:
+              command: [ "sh","-c","/bin/sh -c 'nc -z 127.0.0.1 5432'" ]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 60
+          livenessProbe:
+            exec:
+              command: [ "sh","-c","/bin/sh -c 'nc -z 127.0.0.1 5432'" ]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 6
+
+-e 
+
+
+===============================
+File: ./ssm-proxy/templates/service.yaml
+===============================
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.service.name }}
+  labels: { app: ssm-proxy }
+spec:
+  type: {{ .Values.service.type }}
+  selector: { app: ssm-proxy }
+  ports:
+    - name: pg
+      port: {{ .Values.service.port }}
+      targetPort: {{ .Values.localPort }}
+
+-e 
+
+
+===============================
+File: ./ssm-proxy/templates/configmap.yaml
+===============================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ssm-proxy-config
+data:
+  AWS_REGION: {{ .Values.aws.region | quote }}
+  BASTION_INSTANCE_ID: {{ required "set --set bastionId=<id>" .Values.bastionId | quote }}
+  RDS_ENDPOINT: {{ required "set --set rds.endpoint=<endpoint>" .Values.rds.endpoint | quote }}
+  LOCAL_PORT: {{ .Values.localPort | quote }}
+  REMOTE_PORT: {{ .Values.rds.remotePort | quote }}
+
+-e 
+
+
+===============================
+File: ./ssm-proxy/values.yaml
+===============================
+aws:
+  region: eu-west-3
+  accessKeyId: ""
+  secretAccessKey: ""
+  sessionToken: ""
+
+bastionId: ""        # rempli via --set
+rds:
+  endpoint: ""       # rempli via --set
+  remotePort: 5432
+localPort: 5432
+
+image:
+  name: debian
+  tag: stable-slim
+  pullPolicy: IfNotPresent
+
+resources: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+service:
+  name: postgres-rds
+  type: ClusterIP
+  port: 5432
+
+-e 
+
+
+===============================
+File: ./postgres-grafana/postgres-deployment.yaml
+===============================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana-postgres
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grafana-postgres
+  template:
+    metadata:
+      labels:
+        app: grafana-postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:15
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              value: grafana
+            - name: POSTGRES_USER
+              value: grafana
+            - name: POSTGRES_PASSWORD
+              value: grafana_pass
+          volumeMounts:
+            - name: postgres-storage
+              mountPath: /var/lib/postgresql/data
+      volumes:
+        - name: postgres-storage
+          persistentVolumeClaim:
+            claimName: grafana-postgres-pvc
+
+-e 
+
+
+===============================
+File: ./postgres-grafana/postgres-service.yaml
+===============================
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana-postgres
+spec:
+  type: ClusterIP
+  selector:
+    app: grafana-postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+
+-e 
+
+
+===============================
+File: ./postgres-grafana/postgres-pvc.yaml
+===============================
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: grafana-postgres-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+
+-e 
+
+

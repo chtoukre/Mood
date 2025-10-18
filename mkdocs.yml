@@ -1,0 +1,58 @@
+site_name: Mood Tracker Documentation
+site_description: Secure Mood Tracking Platform with AWS RDS, Kubernetes, Terraform and Grafana
+site_author: Your Name
+repo_name: mood-tracker
+repo_url: https://github.com/yourusername/mood-tracker
+
+theme:
+  name: material
+  language: en
+  features:
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - toc.integrate
+    - content.code.copy
+    - content.tabs.link
+    - search.highlight
+    - search.share
+  palette:
+    - scheme: default
+      primary: blue
+      accent: teal
+
+nav:
+  - Home: index.md
+  - Architecture: 
+    - Architecture: architecture.md
+    - AWS-Infrastructure: aws-infra.md
+  - Setup:
+      - AWS & Terraform: setup.md
+      - SSM Tunnel: tunnel-ssm.md
+      - Kubernetes: kubernetes.md
+  - Usage:
+      - Python Scripts: usage.md
+  - Roadmap: roadmap.md
+
+
+markdown_extensions:
+  - admonition
+  - codehilite
+  - toc:
+      permalink: true
+  - tables
+  - footnotes
+  - attr_list
+  - def_list
+  - md_in_html
+
+plugins:
+  - search
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/yourusername
+    - icon: fontawesome/brands/linkedin
+      link: https://linkedin.com/in/yourprofile
+

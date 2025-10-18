@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ssm-proxy-config
+data:
+  AWS_REGION: {{ .Values.aws.region | quote }}
+  BASTION_INSTANCE_ID: {{ required "set --set bastionId=<id>" .Values.bastionId | quote }}
+  RDS_ENDPOINT: {{ required "set --set rds.endpoint=<endpoint>" .Values.rds.endpoint | quote }}
+  LOCAL_PORT: {{ .Values.localPort | quote }}
+  REMOTE_PORT: {{ .Values.rds.remotePort | quote }}
+

@@ -1,0 +1,80 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ssm-proxy
+  labels: { app: ssm-proxy }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: ssm-proxy }
+  template:
+    metadata:
+      labels: { app: ssm-proxy }
+    spec:
+      containers:
+        # 1) Tunnel SSM -> 127.0.0.1:15432
+        - name: ssm-tunnel
+          image: debian:stable-slim
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - secretRef: { name: aws-creds }
+            - configMapRef: { name: ssm-proxy-config }
+          command: ["/bin/sh","-c"]
+          args:
+            - |
+              set -e
+              apt-get update
+              apt-get install -y --no-install-recommends curl unzip ca-certificates groff less python3 python3-pip netcat-openbsd
+              python3 -m pip install --break-system-packages awscli
+              # Plugin SSM ARM64 (Minikube sur Mac M1/M2)
+              curl -fsSL "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_arm64/session-manager-plugin.deb" -o /tmp/ssm.deb
+              dpkg -i /tmp/ssm.deb || apt-get -f install -y
+              echo "🔐 Region=$AWS_REGION | 🎯 Bastion=$BASTION_INSTANCE_ID | 🗄 RDS=$RDS_ENDPOINT"
+              # Tunnel SSM -> 127.0.0.1:15432 (loopback)
+              while true; do
+                aws ssm start-session \
+                  --region "$AWS_REGION" \
+                  --target "$BASTION_INSTANCE_ID" \
+                  --document-name AWS-StartPortForwardingSessionToRemoteHost \
+                  --parameters "{\"host\":[\"$RDS_ENDPOINT\"],\"portNumber\":[\"5432\"],\"localPortNumber\":[\"15432\"]}" || true
+                echo "SSM tunnel ended. Reconnecting in 3s..."
+                sleep 3
+              done
+          readinessProbe:
+            exec:
+              command: [ "sh","-c","nc -z 127.0.0.1 15432" ]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 60
+          livenessProbe:
+            exec:
+              command: [ "sh","-c","nc -z 127.0.0.1 15432" ]
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            failureThreshold: 6
+
+        # 2) Sidecar socat -> expose 0.0.0.0:5432 vers 127.0.0.1:15432
+        - name: socat
+          image: alpine/socat:1.8.0.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - "-d"
+            - "-d"
+            - "TCP-LISTEN:5432,reuseaddr,fork,bind=0.0.0.0"
+            - "TCP:127.0.0.1:15432"
+          ports:
+            - name: pg
+              containerPort: 5432
+          readinessProbe:
+            exec:
+              command: [ "sh","-c","/bin/sh -c 'nc -z 127.0.0.1 5432'" ]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 60
+          livenessProbe:
+            exec:
+              command: [ "sh","-c","/bin/sh -c 'nc -z 127.0.0.1 5432'" ]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 6
+
