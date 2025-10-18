@@ -1,6 +1,3 @@
-Here’s **`README.md`** — complete, clean, and documentation-style.
-
----
 
 # Mood Tracker — AWS RDS + Kubernetes (Minikube) + Terraform + Grafana
 
