@@ -1,0 +1,7 @@
+apiVersion: v2
+name: postgres-moodtracker
+description: Local PostgreSQL for Mood Tracker (password pulled from AWS Secrets Manager)
+type: application
+version: 0.1.0
+appVersion: "15"
+

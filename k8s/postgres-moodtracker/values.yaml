@@ -1,0 +1,32 @@
+image:
+  repository: postgres
+  tag: "15"
+  pullPolicy: IfNotPresent
+
+postgres:
+  db: moodtracker
+  user: mooduser
+  # Password comes from AWS Secrets Manager (no plain text here)
+  # Region & secret below
+  port: 5432
+
+aws:
+  region: eu-west-3
+  secretName: rds-postgres-password   # ✅ ton secret existe déjà
+  accessKeyId: ""                     # fourni à l'installation via --set-string
+  secretAccessKey: ""                 # fourni à l'installation via --set-string
+  sessionToken: ""                    # optionnel (MFA)
+
+storage:
+  size: 100Mi      # ✅ réduit comme demandé
+  accessMode: ReadWriteOnce
+
+service:
+  type: ClusterIP
+  port: 5432
+
+resources: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+

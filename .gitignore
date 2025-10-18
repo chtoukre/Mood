@@ -1,12 +1,93 @@
 .DS_Store
 .*.swp
 .env
-*.tfvars
+**.tfvars
 .terraform.lock.hcl
-*/terraform.tfstate
-*/terraform.tfstate.backup
-*/terraform.tfstate.*
+**/terraform.tfstate
+**/terraform.tfstate.backup
+**/terraform.tfstate.*
 */.terraform/
 /data
 .venv
 *.pem
+*/.backup
+.backup
+k8s/backups
+
+
+# -----------------------------
+# Terraform
+# -----------------------------
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+.terraform/
+.terraform.lock.hcl
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# -----------------------------
+# Python
+# -----------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.swp
+*.log
+.env
+.venv/
+venv/
+env/
+
+# -----------------------------
+# AWS credentials (safety)
+# -----------------------------
+*.pem
+aws_credentials
+.aws/
+credentials
+
+# -----------------------------
+# Kubernetes / Helm
+# -----------------------------
+*.kube
+*.crt
+*.key
+chart/*.tgz
+
+# -----------------------------
+# Backups
+# -----------------------------
+backups/
+*.sql.gz
+*.dump
+
+# -----------------------------
+# Logs and OS files
+# -----------------------------
+*.log
+.DS_Store
+Thumbs.db
+
+# -----------------------------
+# Editor folders
+# -----------------------------
+.vscode/
+.idea/
+*.iml
+
+# -----------------------------
+# MkDocs build
+# -----------------------------
+site/
+
+# -----------------------------
+# Other temp
+# -----------------------------
+tmp/
+*.tmp
+

@@ -32,6 +32,10 @@ nav:
       - Kubernetes: kubernetes.md
   - Usage:
       - Python Scripts: usage.md
+  - Kubernetes – Helm:
+      - Postgres via Helm: postgres-helm.md
+  - Backups:
+      - S3 Backups & Restore: backup-s3.md
   - Roadmap: roadmap.md
 
 

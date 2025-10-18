@@ -1,0 +1,1579 @@
+# System Architecture
+
+The Mood Tracker project uses a **cloud + local hybrid architecture** that enables secure development and data visualization without exposing any database publicly. The architecture is designed to evolve progressively from a **local CLI prototype** to a **cloud-native application**.
+
+---
+
+## 🔧 High-Level Architecture
+
+```
+
+Developer Laptop
+│
+│  (Minikube cluster)
+│    ├─ Grafana (dashboards)
+│    ├─ mood scripts (Python)
+│    └─ SSM Proxy Pod  ────────────────┐
+│                                      │  (AWS Systems Manager – encrypted)
+│                                      ▼
+│                              Bastion Instance (EC2)
+│                                      │  (private subnet)
+│                                      ▼
+│                            AWS RDS PostgreSQL (Private)
+
+```
+
+🎯 Purpose:
+- Secure database access using **SSM** (no public access)
+- Kubernetes pod acts as a **tunnel endpoint**
+- Grafana connects to RDS **privately** via `ssm-proxy`
+
+---
+
+## ✅ Components Overview
+
+| Component | Technology | Purpose |
+|-----------|------------|---------|
+| **RDS PostgreSQL** | AWS RDS | Stores mood entries |
+| **Bastion EC2** | AWS | Endpoint for SSM port-forwarding |
+| **SSM Proxy Pod** | Kubernetes + AWS CLI | Maintains tunnel to RDS |
+| **Grafana** | Kubernetes / Docker | Dashboards and analytics |
+| **Python Scripts** | CLI | Collect and insert mood entries |
+| **Terraform** | AWS automation | Creates VPC, subnets, RDS, IAM |
+| **Minikube** | Local Kubernetes | Dev environment |
+| **AWS SSM** | AWS Systems Manager | Secure tunneling |
+
+---
+
+## 🔐 Security Model
+
+### AWS Private Networking
+- RDS is deployed **in private subnets**
+- It has **NO public endpoint**
+- Only **Bastion + SSM proxy pod** can reach it (via security groups)
+
+### Secure Connectivity with SSM
+✅ No SSH keys  
+✅ No public ports  
+✅ Connection authorized via IAM  
+✅ Encrypted via AWS SSM
+
+### Zero Public Exposure Design
+| Layer | Exposure |
+|-------|----------|
+| RDS | ❌ No public internet |
+| Bastion | ❌ No SSH / Only SSM |
+| k8s connection | ✅ Only via `ssm-proxy` |
+| Secrets | ✅ Stored in AWS Secrets Manager |
+
+---
+
+## 🧩 Kubernetes Access to AWS RDS
+
+The SSM pipeline works like this:
+
+```
+
+Kubernetes Pod (ssm-proxy)
+│
+├── opens local port 15432 (loopback)
+├── uses AWS SSM to forward traffic
+│       to Bastion → RDS 5432
+│
+└── exposes a Service: postgres-rds:5432
+
+```
+
+✅ Then Grafana connects inside the cluster:
+```
+
+postgres-rds.default.svc.cluster.local:5432
+
+```
+
+---
+
+## 📦 Data Flow
+
+```
+
+Python CLI → (optional JSON/CSV) → PostgreSQL (local or AWS RDS) → Grafana Dashboards
+
+```
+
+---
+
+## 🏗️ Infrastructure Layers
+
+| Layer | Tool |
+|-------|------|
+| IaC | Terraform |
+| Cloud Provider | AWS |
+| Runtime | Kubernetes (Minikube) |
+| DB | PostgreSQL |
+| Secure Access | AWS SSM |
+| Monitoring | Grafana |
+
+---
+
+## ❗ Why not expose RDS publicly?
+
+Because this project is designed with **security-first architecture**, similar to **real production systems**.
+- Avoids public database endpoints
+- Avoids IP whitelisting
+- Eliminates SSH bastion management
+- Uses Zero-Trust principles via IAM + SSM
+
+---
+
+✅ Next: Learn how to **deploy the AWS infrastructure** → proceed to **[Setup Guide](setup.md)**.
+
+# AWS Terraform Deployment
+
+This page documents the **exact AWS infrastructure** used by Mood Tracker and how to deploy it with **Terraform**.  
+It provisions a **private RDS PostgreSQL**, a **private Bastion (EC2) managed by SSM**, **VPC interface endpoints** required for SSM, and all networking/Security Groups.
+
+> Password strategy: **AWS Secrets Manager** (the DB password is read from an existing secret named `rds-postgres-password`).
+
+---
+
+## 🔎 Architecture Overview
+
+```
+
+┌───────────────────────────────────────────────────────────────────┐
+│ AWS Region: eu-west-3 (Paris)                                     │
+│                                                                   │
+│  VPC 10.0.0.0/16                                                  │
+│  ┌─────────────────────────────────────────────────────────────┐  │
+│  │ Private Subnets:                                            │  │
+│  │  - subnet_a (10.0.1.0/24, AZ a)                             │  │
+│  │  - subnet_b (10.0.2.0/24, AZ b)                             │  │
+│  │                                                             │  │
+│  │  Bastion EC2 (no public IP)                                 │  │
+│  │   • IAM role: AmazonSSMManagedInstanceCore                  │  │
+│  │   • SSM Agent                                               │  │
+│  │   • Security Group: bastion-private-sg (egress only)        │  │
+│  │                                                             │  │
+│  │  RDS PostgreSQL (private)                                   │  │
+│  │   • Subnet group: [subnet_a, subnet_b]                      │  │
+│  │   • Security Group: rds-security-group                      │  │
+│  │   • Ingress 5432 from bastion SG only                       │  │
+│  │                                                             │  │
+│  │  VPC Interface Endpoints:                                   │  │
+│  │   • com.amazonaws.eu-west-3.ssm                             │  │
+│  │   • com.amazonaws.eu-west-3.ssmmessages                     │  │
+│  │   • com.amazonaws.eu-west-3.ec2messages                     │  │
+│  │   • (Gateway) S3 endpoint for SSM artifacts                 │  │
+│  └─────────────────────────────────────────────────────────────┘  │
+└───────────────────────────────────────────────────────────────────┘
+
+```
+
+**Why this design?**
+- **No public exposure** of the database.
+- **SSM-only access** to Bastion (no SSH keys).
+- **Least-privilege security groups** (Bastion SG → RDS SG on 5432).
+- **VPC endpoints** ensure SSM works even without Internet/NAT.
+
+---
+
+## 📂 Files Overview (as-is)
+
+Your Terraform is split across the following files:
+
+- `provider.tf` – Providers & versions
+- `variables.tf` – Input variables (db username, region)
+- `network.tf` – VPC, private subnets, DB subnet group
+- `route.tf` – Private route table & associations
+- `security.tf` – SGs for Bastion & RDS, and ingress rule
+- `bastion.tf` – Bastion AMI, IAM role/profile, EC2 instance
+- `endpoints.tf` – SSM/EC2Messages/SSMMessages/S3 VPC endpoints (+ SG)
+- `secrets.tf` – Data sources to read the DB password from Secrets Manager
+- `rds.tf` – RDS PostgreSQL instance (private)
+- `outputs.tf` – Useful outputs (DB endpoint, Secret ARN, Bastion instance id)
+- `main.tf` – (intentionally empty in your layout)
+
+> Region: **eu-west-3**. Adjust via `provider.tf` or pass `-var aws_region=...` if you wire it into the provider.
+
+---
+
+## 🔐 Secrets (AWS Secrets Manager)
+
+This setup **expects** a secret named `rds-postgres-password` to already exist.  
+The RDS instance reads the admin password via:
+
+```hcl
+data "aws_secretsmanager_secret" "db_password" {
+  name = "rds-postgres-password"
+}
+
+data "aws_secretsmanager_secret_version" "db_password_value" {
+  secret_id = data.aws_secretsmanager_secret.db_password.id
+}
+````
+
+Create/update the secret if needed:
+
+```bash
+aws secretsmanager create-secret \
+  --name rds-postgres-password \
+  --secret-string 'YourStrong#Password123' \
+  --region eu-west-3
+# or update:
+aws secretsmanager put-secret-value \
+  --secret-id rds-postgres-password \
+  --secret-string 'YourStrong#Password123' \
+  --region eu-west-3
+```
+
+---
+
+## 🧩 Key Snippets (exact from your code)
+
+### Provider & Versions (`provider.tf`)
+
+```hcl
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+  required_version = ">= 1.3.0"
+}
+
+provider "aws" {
+  region = "eu-west-3" # Paris
+}
+```
+
+### Variables (`variables.tf`)
+
+```hcl
+variable "db_username" {
+  description = "Nom de l'utilisateur admin PostgreSQL"
+  type        = string
+}
+
+variable "aws_region" {
+  description = "AWS region"
+  type        = string
+  default     = "eu-west-3"
+}
+```
+
+### Networking (`network.tf`)
+
+```hcl
+resource "aws_vpc" "main" {
+  cidr_block           = "10.0.0.0/16"
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+  tags = { Name = "main-vpc" }
+}
+
+resource "aws_subnet" "subnet_a" {
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = "10.0.1.0/24"
+  availability_zone       = "eu-west-3a"
+  map_public_ip_on_launch = false
+  tags = { Name = "private-subnet-a" }
+}
+
+resource "aws_subnet" "subnet_b" {
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = "10.0.2.0/24"
+  availability_zone       = "eu-west-3b"
+  map_public_ip_on_launch = false
+  tags = { Name = "private-subnet-b" }
+}
+
+resource "aws_db_subnet_group" "postgres_subnets" {
+  name       = "postgres-subnet-group"
+  subnet_ids = [aws_subnet.subnet_a.id, aws_subnet.subnet_b.id]
+  description = "Private subnets for PostgreSQL RDS"
+  tags = { Name = "postgres-subnet-group" }
+}
+```
+
+### Routes (`route.tf`)
+
+```hcl
+resource "aws_route_table" "private_rt" {
+  vpc_id = aws_vpc.main.id
+  tags   = { Name = "private-route-table" }
+}
+
+resource "aws_route_table_association" "private_a" {
+  subnet_id      = aws_subnet.subnet_a.id
+  route_table_id = aws_route_table.private_rt.id
+}
+
+resource "aws_route_table_association" "private_b" {
+  subnet_id      = aws_subnet.subnet_b.id
+  route_table_id = aws_route_table.private_rt.id
+}
+```
+
+### Security Groups (`security.tf`)
+
+```hcl
+resource "aws_security_group" "rds_sg" {
+  name        = "rds-security-group"
+  description = "Allow PostgreSQL access from bastion only"
+  vpc_id      = aws_vpc.main.id
+
+  egress { from_port = 0 to_port = 0 protocol = "-1" cidr_blocks = ["0.0.0.0/0"] }
+  tags = { Name = "rds-sg" }
+}
+
+resource "aws_security_group" "bastion_sg" {
+  name        = "bastion-private-sg"
+  description = "Private bastion for connecting via SSM"
+  vpc_id      = aws_vpc.main.id
+
+  egress { from_port = 0 to_port = 0 protocol = "-1" cidr_blocks = ["0.0.0.0/0"] }
+  tags = { Name = "bastion-sg" }
+}
+
+resource "aws_security_group_rule" "rds_from_bastion" {
+  type                     = "ingress"
+  description              = "Allow traffic from bastion to RDS PostgreSQL"
+  from_port                = 5432
+  to_port                  = 5432
+  protocol                 = "tcp"
+  security_group_id        = aws_security_group.rds_sg.id
+  source_security_group_id = aws_security_group.bastion_sg.id
+}
+```
+
+### Bastion & IAM (`bastion.tf`)
+
+```hcl
+data "aws_ami" "al2" {
+  most_recent = true
+  owners      = ["amazon"]
+  filter { name = "name" values = ["amzn2-ami-hvm-*-x86_64-gp2"] }
+}
+
+resource "aws_iam_role" "bastion_role" {
+  name = "bastion-ssm-role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [{
+      Effect = "Allow",
+      Principal = { Service = "ec2.amazonaws.com" },
+      Action = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "bastion_ssm_core" {
+  role       = aws_iam_role.bastion_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource "aws_iam_instance_profile" "bastion_profile" {
+  name = "bastion-ssm-instance-profile"
+  role = aws_iam_role.bastion_role.name
+}
+
+resource "aws_instance" "bastion" {
+  ami                         = data.aws_ami.al2.id
+  instance_type               = "t3.micro"
+  subnet_id                   = aws_subnet.subnet_a.id
+  associate_public_ip_address = false
+  iam_instance_profile        = aws_iam_instance_profile.bastion_profile.name
+  vpc_security_group_ids      = [aws_security_group.bastion_sg.id]
+
+  user_data = <<-EOF
+              #!/bin/bash
+              yum update -y
+              yum install -y postgresql
+              EOF
+
+  tags = { Name = "bastion-private" }
+}
+```
+
+### VPC Endpoints (`endpoints.tf`)
+
+```hcl
+data "aws_region" "current" {}
+
+resource "aws_security_group" "vpce_sg" {
+  name   = "vpc-endpoints-ssm-sg"
+  vpc_id = aws_vpc.main.id
+
+  ingress {
+    description = "Allow HTTPS from bastion"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    security_groups = [aws_security_group.bastion_sg.id]
+  }
+
+  egress { from_port = 0 to_port = 0 protocol = "-1" cidr_blocks = ["0.0.0.0/0"] }
+  tags = { Name = "vpce-ssm-sg" }
+}
+
+resource "aws_vpc_endpoint" "ssm" {
+  vpc_id              = aws_vpc.main.id
+  service_name        = "com.amazonaws.${data.aws_region.current.name}.ssm"
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = [aws_subnet.subnet_a.id, aws_subnet.subnet_b.id]
+  security_group_ids  = [aws_security_group.vpce_sg.id]
+  private_dns_enabled = true
+}
+
+resource "aws_vpc_endpoint" "ssmmessages" {
+  vpc_id              = aws_vpc.main.id
+  service_name        = "com.amazonaws.${data.aws_region.current.name}.ssmmessages"
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = [aws_subnet.subnet_a.id, aws_subnet.subnet_b.id]
+  security_group_ids  = [aws_security_group.vpce_sg.id]
+  private_dns_enabled = true
+}
+
+resource "aws_vpc_endpoint" "ec2messages" {
+  vpc_id              = aws_vpc.main.id
+  service_name        = "com.amazonaws.${data.aws_region.current.name}.ec2messages"
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = [aws_subnet.subnet_a.id, aws_subnet.subnet_b.id]
+  security_group_ids  = [aws_security_group.vpce_sg.id]
+  private_dns_enabled = true
+}
+
+resource "aws_vpc_endpoint" "s3" {
+  vpc_id       = aws_vpc.main.id
+  service_name = "com.amazonaws.${data.aws_region.current.name}.s3"
+  route_table_ids = [aws_vpc.main.default_route_table_id]
+}
+```
+
+### RDS (`rds.tf`)
+
+```hcl
+resource "aws_db_instance" "postgres" {
+  identifier             = "my-postgres-db"
+  engine                 = "postgres"
+  engine_version         = "15"
+  instance_class         = "db.t3.micro"
+  allocated_storage      = 20
+
+  username               = var.db_username
+  password               = data.aws_secretsmanager_secret_version.db_password_value.secret_string
+
+  db_subnet_group_name   = aws_db_subnet_group.postgres_subnets.name
+  vpc_security_group_ids = [aws_security_group.rds_sg.id]
+
+  skip_final_snapshot    = true
+  publicly_accessible    = false
+
+  tags = { Name = "postgres-rds" }
+}
+```
+
+### Outputs (`outputs.tf`)
+
+```hcl
+output "db_endpoint" {
+  description = "Endpoint PostgreSQL"
+  value       = aws_db_instance.postgres.address
+}
+output "db_secret_arn" {
+  description = "ARN du secret contenant le mot de passe PostgreSQL"
+  value       = data.aws_secretsmanager_secret.db_password.arn
+}
+output "bastion_instance_id" {
+  description = "ID de l'instance bastion pour tunnel SSM"
+  value       = aws_instance.bastion.id
+}
+```
+
+---
+
+## 🚀 Deploy
+
+1. **Create/Update** the secret:
+
+```bash
+aws secretsmanager create-secret \
+  --name rds-postgres-password \
+  --secret-string 'YourStrong#Password123' \
+  --region eu-west-3 || true
+
+# or update if it already exists
+aws secretsmanager put-secret-value \
+  --secret-id rds-postgres-password \
+  --secret-string 'YourStrong#Password123' \
+  --region eu-west-3
+```
+
+2. **Apply Terraform**:
+
+```bash
+cd infra
+terraform init
+terraform apply
+```
+
+3. **Get outputs**:
+
+```bash
+terraform output -raw bastion_instance_id
+terraform output -raw db_endpoint
+terraform output -raw db_secret_arn
+```
+
+---
+
+## 🧪 Validate SSM & RDS
+
+Open a **local** SSM port forward (optional, for quick test from laptop):
+
+```bash
+aws ssm start-session \
+  --target $(terraform output -raw bastion_instance_id) \
+  --document-name AWS-StartPortForwardingSessionToRemoteHost \
+  --parameters '{"host":["'$(terraform output -raw db_endpoint)'"],"portNumber":["5432"],"localPortNumber":["5432"]}'
+```
+
+Then:
+
+```bash
+psql -h 127.0.0.1 -U <db_user> -d postgres -p 5432 sslmode=require
+# Password = value stored in Secrets Manager
+```
+
+> In Kubernetes, use the **SSM Proxy chart** and connect to
+> `postgres-rds.default.svc.cluster.local:5432`.
+
+---
+
+## 🔐 Security Notes
+
+* **No public IPs** on Bastion/RDS.
+* RDS allows inbound **only from Bastion SG** on port 5432.
+* Use **AWS RDS CA bundle** for TLS (`verify-ca`) in production:
+
+  * [https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem](https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem)
+* Terminate stale sessions:
+
+  ```bash
+  aws ssm describe-sessions --state Active
+  aws ssm terminate-session --session-id <ID>
+  ```
+
+---
+
+## 🧰 Troubleshooting
+
+| Symptom                                        | Likely Cause             | Fix                                                                    |
+| ---------------------------------------------- | ------------------------ | ---------------------------------------------------------------------- |
+| `InvalidSubnet: No default subnet`             | RDS expects subnet group | Ensure `aws_db_subnet_group` exists & is set                           |
+| `Cannot create publicly accessible DBInstance` | No IGW/NAT (private)     | RDS is intended **private** → do not set `publicly_accessible=true`    |
+| SSM sessions very slow                         | Missing VPC endpoints    | Ensure `ssm`, `ssmmessages`, `ec2messages`, and gateway `s3` endpoints |
+| `DependencyViolation` SG delete                | SG still referenced      | Detach from RDS/EC2, remove rules, retry destroy                       |
+| `no pg_hba.conf entry ... no encryption`       | SSL required by RDS      | Use `sslmode=require` or `verify-ca`                                   |
+| Timeout to RDS                                 | SG or tunnel issue       | Check `aws_security_group_rule.rds_from_bastion` and SSM logs          |
+
+---
+
+## 🗑️ Destroy
+
+```bash
+cd infra
+terraform destroy
+```
+
+> If `destroy` is blocked by dependencies (SG, endpoints), remove dependents first (e.g., RDS) and retry.
+
+---
+
+```
+
+
+```
+
+# Mood Tracker Documentation
+
+Welcome to the **Mood Tracker** project – a secure and extensible daily logging platform designed to track well-being over time. The project leverages **AWS**, **Terraform**, **Kubernetes (Minikube)**, **Grafana**, and **PostgreSQL**, with a foundation ready to evolve into a full web application with authentication and dashboards.
+
+---
+
+## ✅ Project Goals
+
+- Collect **daily emotional metrics** (mood, gratitude, calm, family, energy, etc.)
+- Store data **locally** (JSON/CSV) and/or in **PostgreSQL**
+- Provide a **secure cloud-based database** using **AWS RDS (private)**
+- Access AWS RDS securely via **SSM tunnel (no public exposure)**
+- Visualize insights via **Grafana dashboards**
+- Evolve gradually into a **web app** (frontend + backend + RDS)
+- Demonstrate **real DevOps architecture** (AWS + Terraform + Kubernetes)
+
+---
+
+## 🔧 Technology Overview
+
+| Component               | Technology                          |
+|------------------------|--------------------------------------|
+| Infrastructure         | Terraform + AWS                      |
+| Database               | PostgreSQL (local + AWS RDS)         |
+| Secure access          | AWS SSM Bastion + Kubernetes tunnel  |
+| Dashboards             | Grafana                              |
+| Scripting interface    | Python CLI tools                     |
+| Local Dev Environment  | Minikube + Docker Compose            |
+| Documentation          | MkDocs + Material Theme              |
+
+---
+
+## 🚀 Repository Highlights
+
+✅ Private AWS RDS PostgreSQL via SSM (no public DB access)  
+✅ Kubernetes pod as **secure database proxy** (`ssm-proxy`)  
+✅ Terraform AWS infrastructure module included  
+✅ Python CLI scripts to insert daily logs  
+✅ Local Grafana for data exploration  
+✅ Ready for future **frontend + API** integration  
+✅ Clean architecture for **learning or production** projects  
+
+---
+
+## 📚 Documentation Structure
+
+This documentation will guide you through:
+
+| Section | Description |
+|----------|-------------|
+| **Architecture** | System design (AWS + k8s + SSM) |
+| **Setup** | Deploy infra & local environment |
+| **Usage** | Python scripts + local DB + Grafana |
+| **SSM Tunnel** | Secure access to private RDS |
+| **Roadmap** | Future vision of the project |
+
+---
+
+## ✅ Quick Start
+
+```bash
+# Clone the repo
+git clone https://github.com/yourusername/mood-tracker.git
+cd mood-tracker
+
+# Launch documentation preview
+mkdocs serve
+
+# Kubernetes (Minikube) Setup
+
+This guide explains how to run the Mood Tracker stack entirely on **Kubernetes (Minikube)** using your manifests:
+- Local **PostgreSQL** for development (`postgres-moodtracker/`)
+- **Grafana** backed by its own Postgres (`postgres-grafana/`)
+- **AWS SSM proxy** (`ssm-proxy/`) to reach **private RDS** from inside the cluster
+
+> Namespace: **default** (as per your files)
+
+---
+
+## 1) Prerequisites
+
+- Minikube installed and running
+- kubectl + Helm installed
+- AWS CLI configured (for SSM proxy to AWS)
+- Terraform deployed infra (to obtain `bastion_instance_id` & `db_endpoint`)
+
+Start Minikube:
+```bash
+minikube start
+kubectl get nodes
+````
+
+---
+
+## 2) Deploy Local Postgres (Dev/Test)
+
+This Postgres is used for:
+
+* local testing
+* Python-generated data
+* quick Grafana dashboards without AWS
+
+Apply manifests:
+
+```bash
+kubectl apply -f k8s/postgres-moodtracker/postgres-deployment.yaml
+kubectl apply -f k8s/postgres-moodtracker/postgres-service.yaml
+```
+
+Verify:
+
+```bash
+kubectl get pods -l app=postgres
+kubectl get svc postgres
+```
+
+Test from a debug pod:
+
+```bash
+kubectl run -it --rm netshoot --image=nicolaka/netshoot --restart=Never -- \
+  nc -zv postgres.default.svc.cluster.local 5432
+```
+
+---
+
+## 3) Deploy Grafana (+ its own DB)
+
+Grafana is configured to use its **own Postgres** (`grafana-postgres`) for persistence.
+
+Apply manifests:
+
+```bash
+kubectl apply -f k8s/postgres-grafana/postgres-pvc.yaml
+kubectl apply -f k8s/postgres-grafana/postgres-deployment.yaml
+kubectl apply -f k8s/postgres-grafana/postgres-service.yaml
+
+kubectl apply -f k8s/grafana-deployment.yaml
+kubectl apply -f k8s/grafana-service.yaml
+```
+
+Access Grafana:
+
+```bash
+minikube service grafana --url
+# Or NodePort: http://localhost:32000  (as per grafana-service.yaml)
+# Login: admin / admin
+```
+
+---
+
+## 4) Deploy AWS SSM Proxy (Helm)
+
+This chart opens a **secure SSM tunnel** via the Bastion EC2 to the **private RDS**,
+and exposes it as a Service `postgres-rds:5432` for in-cluster access (Grafana, scripts, pods).
+
+From repo root:
+
+```bash
+# Export AWS credentials (temporary or long-lived)
+export AWS_ACCESS_KEY_ID=...
+export AWS_SECRET_ACCESS_KEY=...
+export AWS_SESSION_TOKEN=...   # if applicable
+
+# Pull Terraform outputs
+export BASTION_ID=$(cd infra && terraform output -raw bastion_instance_id)
+export RDS_ENDPOINT=$(cd infra && terraform output -raw db_endpoint)
+
+# Install Helm chart (default namespace)
+helm install ssm-proxy k8s/ssm-proxy \
+  --set aws.region=eu-west-3 \
+  --set bastionId="$BASTION_ID" \
+  --set rds.endpoint="$RDS_ENDPOINT" \
+  --set-string aws.accessKeyId="$AWS_ACCESS_KEY_ID" \
+  --set-string aws.secretAccessKey="$AWS_SECRET_ACCESS_KEY" \
+  --set-string aws.sessionToken="${AWS_SESSION_TOKEN}"
+```
+
+Check readiness:
+
+```bash
+kubectl get pods -l app=ssm-proxy
+kubectl get svc postgres-rds
+kubectl get endpoints postgres-rds
+# ✅ Should show one or more pod IPs with :5432
+```
+
+Connectivity test:
+
+```bash
+kubectl run -it --rm netshoot --image=nicolaka/netshoot --restart=Never -- \
+  nc -zv postgres-rds.default.svc.cluster.local 5432
+```
+
+---
+
+## 5) Configure Grafana to AWS RDS (via SSM)
+
+In Grafana UI → **Connections → Data sources → Add data source → PostgreSQL**:
+
+* **Host**: `postgres-rds.default.svc.cluster.local:5432`
+* **Database**: `postgres` (or your DB name)
+* **User**: your RDS user (e.g., `admin` or app user)
+* **Password**: from AWS Secrets Manager (paste temporarily)
+* **TLS/SSL**: `require` (works); for production use `verify-ca` with AWS CA bundle
+
+> AWS CA bundle:
+> [https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem](https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem)
+
+(Optional) Mount CA to Grafana pod and set **SSL Mode = verify-ca**, **Root cert path** accordingly.
+
+---
+
+## 6) Connect Python Scripts
+
+For local dev Postgres:
+
+```
+host="postgres.default.svc.cluster.local"
+port=5432
+dbname="moodtracker"
+user="mooduser"
+password="moodpass"
+```
+
+For AWS RDS **from inside cluster**:
+
+```
+host="postgres-rds.default.svc.cluster.local"
+port=5432
+dbname="<your_db>"
+user="<your_user>"
+password="<your_password>"
+```
+
+> For local laptop direct access to RDS, use a **local SSM port-forward session** via AWS CLI and target `127.0.0.1:5432`.
+
+---
+
+## 7) Optional: Ingress for Grafana
+
+If you prefer **[http://grafana.local/](http://grafana.local/)** instead of NodePort, enable Ingress:
+
+1. Enable Ingress addon in Minikube:
+
+```bash
+minikube addons enable ingress
+```
+
+2. Example Ingress (create `k8s/grafana-ingress.yaml`):
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: grafana
+  annotations:
+    kubernetes.io/ingress.class: nginx
+spec:
+  rules:
+    - host: grafana.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: grafana
+                port:
+                  number: 3000
+```
+
+3. Add to `/etc/hosts`:
+
+```
+127.0.0.1 grafana.local
+```
+
+4. Apply:
+
+```bash
+kubectl apply -f k8s/grafana-ingress.yaml
+```
+
+---
+
+## 8) One-Command Installer (Helper Script)
+
+Create `k8s/setup.sh` with:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Namespace = default (no creation needed)
+
+echo "▶️ Deploy Postgres (dev)..."
+kubectl apply -f k8s/postgres-moodtracker/postgres-deployment.yaml
+kubectl apply -f k8s/postgres-moodtracker/postgres-service.yaml
+
+echo "▶️ Deploy Grafana Postgres + Grafana..."
+kubectl apply -f k8s/postgres-grafana/postgres-pvc.yaml
+kubectl apply -f k8s/postgres-grafana/postgres-deployment.yaml
+kubectl apply -f k8s/postgres-grafana/postgres-service.yaml
+kubectl apply -f k8s/grafana-deployment.yaml
+kubectl apply -f k8s/grafana-service.yaml
+
+echo "▶️ Install SSM proxy (Helm)..."
+: "${AWS_ACCESS_KEY_ID:?Set AWS_ACCESS_KEY_ID}"
+: "${AWS_SECRET_ACCESS_KEY:?Set AWS_SECRET_ACCESS_KEY}"
+
+BASTION_ID=$(cd infra && terraform output -raw bastion_instance_id)
+RDS_ENDPOINT=$(cd infra && terraform output -raw db_endpoint)
+
+helm upgrade --install ssm-proxy k8s/ssm-proxy \
+  --set aws.region=eu-west-3 \
+  --set bastionId="$BASTION_ID" \
+  --set rds.endpoint="$RDS_ENDPOINT" \
+  --set-string aws.accessKeyId="$AWS_ACCESS_KEY_ID" \
+  --set-string aws.secretAccessKey="$AWS_SECRET_ACCESS_KEY" \
+  --set-string aws.sessionToken="${AWS_SESSION_TOKEN:-}"
+
+echo "✅ Done."
+echo "Grafana: http://localhost:32000  (admin/admin)"
+echo "RDS (in-cluster): postgres-rds.default.svc.cluster.local:5432"
+```
+
+Make it executable:
+
+```bash
+chmod +x k8s/setup.sh
+./k8s/setup.sh
+```
+
+---
+
+## 9) Teardown
+
+```bash
+helm uninstall ssm-proxy
+kubectl delete -f k8s/grafana-service.yaml
+kubectl delete -f k8s/grafana-deployment.yaml
+kubectl delete -f k8s/postgres-grafana/postgres-service.yaml
+kubectl delete -f k8s/postgres-grafana/postgres-deployment.yaml
+kubectl delete -f k8s/postgres-grafana/postgres-pvc.yaml
+kubectl delete -f k8s/postgres-moodtracker/postgres-service.yaml
+kubectl delete -f k8s/postgres-moodtracker/postgres-deployment.yaml
+```
+
+---
+
+## 10) Troubleshooting
+
+| Symptom                                | Cause                                            | Fix                                                                                                               |
+| -------------------------------------- | ------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------- |
+| `postgres-rds` **has no endpoints**    | SSM proxy pod not Ready                          | Check `kubectl logs deploy/ssm-proxy`, ensure AWS creds are valid                                                 |
+| `Connection refused` to `postgres-rds` | socat not binding / tunnel not open              | Ensure sidecar runs; restart pod; verify endpoint shows `:5432`                                                   |
+| Long SSM connect times                 | Existing active session or missing VPC endpoints | Terminate sessions with `aws ssm terminate-session`; ensure VPC endpoints for `ssm`, `ssmmessages`, `ec2messages` |
+| psql SSL error                         | RDS enforces SSL                                 | Use `sslmode=require` or `verify-ca` with AWS CA bundle                                                           |
+| Grafana can’t connect                  | Wrong datasource host                            | Use `postgres-rds.default.svc.cluster.local:5432` (not the AWS hostname directly)                                 |
+
+Useful debug:
+
+```bash
+kubectl get endpoints postgres-rds
+kubectl logs -f deploy/ssm-proxy
+aws ssm describe-sessions --state Active
+```
+
+---
+
+```
+
+
+```
+
+# Roadmap
+
+The Mood Tracker project is designed to evolve progressively from a **local personal CLI tool** into a **secure cloud-based application** with dashboards and per-user analytics. This roadmap tracks that evolution.
+
+---
+
+## ✅ Phase 1 – Local Data Collection (DONE)
+
+| Status | Feature |
+|--------|---------|
+| ✅ | Python CLI script writes JSON and CSV |
+| ✅ | Generate historical fake data |
+| ✅ | Local PostgreSQL instance |
+| ✅ | Grafana dashboards in local environment |
+
+---
+
+## ✅ Phase 2 – AWS Infrastructure (DONE)
+
+| Status | Feature |
+|--------|---------|
+| ✅ | RDS PostgreSQL deployment via Terraform |
+| ✅ | Private database (no public exposure) |
+| ✅ | Bastion + SSM Session access |
+| ✅ | VPC with private subnets |
+| ✅ | Secure SG inbound rules |
+| ✅ | Secrets Manager for password storage |
+
+---
+
+## 🚧 Phase 3 – Kubernetes & Secure RDS Access (IN PROGRESS)
+
+| Status | Feature |
+|--------|---------|
+| ✅ | Local Minikube cluster |
+| ✅ | SSM tunnel from Kubernetes pod |
+| ✅ | DB access via internal Service |
+| ✅ | Test with Python scripts inside pod |
+| 🔄 | Automate DB init & migration |
+| 🔄 | External Secrets Operator (sync AWS → k8s secrets) |
+
+---
+
+## 🔜 Phase 4 – Backend API (COMING NEXT)
+
+| Planned | Feature |
+|---------|---------|
+| 🔜 | FastAPI backend |
+| 🔜 | REST endpoints for mood entry submission |
+| 🔜 | CI/CD pipeline |
+| 🔜 | DB repository layer |
+| 🔜 | Pydantic models |
+| 🔜 | Helm chart for backend |
+
+---
+
+## 🔜 Phase 5 – Frontend App
+
+| Planned | Feature |
+|---------|---------|
+| 🔜 | React/Next.js web app |
+| 🔜 | Authentication (JWT + refresh tokens) |
+| 🔜 | Form for mood input |
+| 🔜 | Personal dashboard page |
+| 🔜 | Secure access per user |
+
+---
+
+## 🔮 Phase 6 – Scalability and Production
+
+| Future | Feature |
+|--------|---------|
+| 🔮 | Deploy on AWS EKS |
+| 🔮 | Replace Minikube for cloud deployment |
+| 🔮 | AWS ALB Ingress Controller |
+| 🔮 | HTTPS (ACM + Load Balancer) |
+| 🔮 | Monitoring with Prometheus |
+| 🔮 | Logs aggregation with Loki |
+| 🔮 | S3 data exports |
+
+---
+
+## 🌍 Phase 7 – Observability Platform
+
+| Future | Feature |
+|--------|---------|
+| 🔮 | AWS Managed Grafana |
+| 🔮 | Per-user dashboard isolation |
+| 🔮 | Time-series analytics |
+| 🔮 | Mood prediction with ML (optional) |
+
+---
+
+## ✅ Contribute to the Roadmap
+
+Want to help or suggest ideas? Open an issue:
+```
+
+[https://github.com/yourusername/mood-tracker/issues](https://github.com/yourusername/mood-tracker/issues)
+
+```
+
+Or submit a PR!
+
+---
+
+This roadmap is **alive** and evolving. Check back often 🚀
+```
+
+---
+
+✅ Docs section is now complete.
+
+Next, I’ll generate **your `docker-compose.yml` full stack**.
+This will include:
+✅ Postgres
+✅ Grafana
+✅ Python script runner
+✅ Optional pgAdmin
+✅ Ready-to-use network
+
+
+# Setup Guide
+
+This guide explains how to deploy the Mood Tracker infrastructure and development environment.
+
+---
+
+## ✅ 1. Prerequisites
+
+### Tools to install
+
+| Tool | Required | Install |
+|------|----------|---------|
+| AWS CLI | ✅ Yes | https://docs.aws.amazon.com/cli |
+| Terraform | ✅ Yes | https://developer.hashicorp.com/terraform |
+| kubectl | ✅ Yes | https://kubernetes.io/docs/tasks/tools |
+| Helm | ✅ Yes | https://helm.sh |
+| Minikube | ✅ Yes | https://minikube.sigs.k8s.io |
+| Python 3.10+ | ✅ Yes | https://python.org |
+| Docker | ✅ Optional | https://docker.com |
+| mkdocs-material | ✅ For docs | `pip install mkdocs-material` |
+
+---
+
+### AWS account & credentials
+
+Configure AWS credentials locally:
+
+```bash
+aws configure
+````
+
+Or use environment variables:
+
+```bash
+export AWS_ACCESS_KEY_ID=YOUR_KEY
+export AWS_SECRET_ACCESS_KEY=YOUR_SECRET
+export AWS_DEFAULT_REGION=eu-west-3
+```
+
+✅ **Make sure your IAM user has permissions**:
+
+* `AmazonEC2FullAccess`
+* `AmazonSSMFullAccess`
+* `AmazonRDSFullAccess`
+* `IAMFullAccess` *(optional for Terraform role creation)*
+
+---
+
+## ✅ 2. Clone the Repository
+
+```bash
+git clone https://github.com/yourusername/mood-tracker.git
+cd mood-tracker
+```
+
+---
+
+## ✅ 3. Deploy AWS Infrastructure (Terraform)
+
+This will create:
+✅ VPC + subnets
+✅ Private RDS PostgreSQL
+✅ Private Bastion EC2 + SSM
+✅ DB subnet groups, security groups
+✅ AWS Secrets Manager entry for db password
+
+```bash
+cd infra
+terraform init
+terraform plan
+terraform apply
+```
+
+Get outputs:
+
+```bash
+terraform output -raw bastion_instance_id
+terraform output -raw db_endpoint
+```
+
+---
+
+## ✅ 4. Start Kubernetes (Minikube)
+
+```bash
+minikube start --cpus=4 --memory=6g
+kubectl get nodes
+```
+
+---
+
+## ✅ 5. Configure Python Environment
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip psycopg2-binary
+```
+
+---
+
+## ✅ 6. Deploy the SSM Tunnel (Helm chart)
+
+```bash
+cd ../k8s/ssm-proxy
+
+# Inject AWS credentials for SSM
+export AWS_ACCESS_KEY_ID=...
+export AWS_SECRET_ACCESS_KEY=...
+export AWS_SESSION_TOKEN=...   # Only if using temporary AWS credentials
+
+export BASTION_ID=$(cd ../../infra && terraform output -raw bastion_instance_id)
+export RDS_ENDPOINT=$(cd ../../infra && terraform output -raw db_endpoint)
+
+helm install ssm-proxy . \
+  --set aws.region=eu-west-3 \
+  --set bastionId="$BASTION_ID" \
+  --set rds.endpoint="$RDS_ENDPOINT" \
+  --set-string aws.accessKeyId="$AWS_ACCESS_KEY_ID" \
+  --set-string aws.secretAccessKey="$AWS_SECRET_ACCESS_KEY"
+```
+
+Verify:
+
+```bash
+kubectl get pods -l app=ssm-proxy
+kubectl get svc postgres-rds
+kubectl get endpoints postgres-rds  # ✅ Should not be empty
+```
+
+---
+
+## ✅ 7. Test RDS Connectivity from Kubernetes
+
+```bash
+kubectl run -it --rm netshoot --image=nicolaka/netshoot --restart=Never -- \
+  nc -zv postgres-rds.default.svc.cluster.local 5432
+```
+
+✅ Success → SSM tunnel works.
+
+---
+
+✅ Continue: next read **[Usage Guide](usage.md)** to insert data & connect Grafana.
+
+```
+
+```
+
+# Usage Guide
+
+This page explains how to:
+✅ Use the Python CLI scripts  
+✅ Insert data into PostgreSQL  
+✅ Generate fake history  
+✅ View data in Grafana  
+
+---
+
+## 📦 Data Model
+
+Each daily entry tracks 20 well-being dimensions:
+
+```python
+ASPECTS = [
+    "moral_global", "gratitude", "pleine_conscience", "famille", "amis",
+    "relation", "plaisir", "calme", "sincerite", "temps_pour_soi",
+    "alimentation", "hydratation", "exercice", "sorties", "sante",
+    "creativite", "finances", "education_travail", "emotions_pensees",
+    "present", "futur"
+]
+```
+
+Database table used (PostgreSQL):
+
+```sql
+CREATE TABLE IF NOT EXISTS mood_entries (
+  date DATE PRIMARY KEY,
+  moral_global INT,
+  gratitude INT,
+  pleine_conscience INT,
+  famille INT,
+  amis INT,
+  relation INT,
+  plaisir INT,
+  calme INT,
+  sincerite INT,
+  temps_pour_soi INT,
+  alimentation INT,
+  hydratation INT,
+  exercice INT,
+  sorties INT,
+  sante INT,
+  creativite INT,
+  finances INT,
+  education_travail INT,
+  emotions_pensees INT,
+  present INT,
+  futur INT,
+  overall_mood INT,
+  note TEXT
+);
+```
+
+---
+
+## ✍️ Manual Daily Entry (Local JSON/CSV)
+
+Run from project root:
+
+```bash
+python scripts/daily-check.py --name mylog
+```
+
+✅ Output:
+
+```
+data/mylog.json
+data/mylog.csv
+```
+
+---
+
+## 🐘 Insert into Local PostgreSQL
+
+If you're using Minikube-local DB from `k8s/postgres-moodtracker`:
+
+```python
+# Edit inside daily-check-k8s.py
+host="localhost"  # or pod URL if inside k8s
+dbname="moodtracker"
+user="mooduser"
+password="moodpass"
+```
+
+Run:
+
+```bash
+python scripts/daily-check-k8s.py --name mylog
+```
+
+---
+
+## ☁️ Insert into AWS RDS (via SSM Tunnel Pod)
+
+If the SSM tunnel is running in Kubernetes:
+
+Use host **inside Kubernetes**:
+
+```
+postgres-rds.default.svc.cluster.local
+```
+
+From Kubernetes pod:
+
+```bash
+kubectl run -it psql --image=postgres --restart=Never \
+  -- psql -h postgres-rds.default.svc.cluster.local -U <user> -d postgres
+```
+
+From Python:
+
+```python
+host="postgres-rds.default.svc.cluster.local"
+port=5432
+```
+
+---
+
+## 🔧 Generate Fake Historical Data
+
+```bash
+python scripts/generate-fake-entry-k8s.py
+```
+
+* Fills DB starting from year 2000 to today
+* Useful for dashboards & Grafana testing
+
+---
+
+## 📊 Use Grafana Locally
+
+You can use:
+
+### Option A — Local Grafana in Kubernetes
+
+```bash
+kubectl port-forward svc/grafana 3000:3000
+```
+
+Access [http://localhost:3000](http://localhost:3000) (admin/admin)
+
+Add PostgreSQL datasource:
+
+```
+Host: postgres-rds.default.svc.cluster.local:5432
+Database: postgres
+User: <your user>
+SSL Mode: require
+```
+
+---
+
+### Option B — Grafana with Docker Compose
+
+Use the full stack (Grafana + Postgres + script runner) via Docker — see root `docker-compose.yml`.
+
+---
+
+✅ Next: see **[SSM Tunnel Details](tunnel-ssm.md)**.
+
+```
+
+
+```
+
+# Usage Guide
+
+This page explains how to:
+✅ Use the Python CLI scripts  
+✅ Insert data into PostgreSQL  
+✅ Generate fake history  
+✅ View data in Grafana  
+
+---
+
+## 📦 Data Model
+
+Each daily entry tracks 20 well-being dimensions:
+
+```python
+ASPECTS = [
+    "moral_global", "gratitude", "pleine_conscience", "famille", "amis",
+    "relation", "plaisir", "calme", "sincerite", "temps_pour_soi",
+    "alimentation", "hydratation", "exercice", "sorties", "sante",
+    "creativite", "finances", "education_travail", "emotions_pensees",
+    "present", "futur"
+]
+````
+
+Database table used (PostgreSQL):
+
+```sql
+CREATE TABLE IF NOT EXISTS mood_entries (
+  date DATE PRIMARY KEY,
+  moral_global INT,
+  gratitude INT,
+  pleine_conscience INT,
+  famille INT,
+  amis INT,
+  relation INT,
+  plaisir INT,
+  calme INT,
+  sincerite INT,
+  temps_pour_soi INT,
+  alimentation INT,
+  hydratation INT,
+  exercice INT,
+  sorties INT,
+  sante INT,
+  creativite INT,
+  finances INT,
+  education_travail INT,
+  emotions_pensees INT,
+  present INT,
+  futur INT,
+  overall_mood INT,
+  note TEXT
+);
+```
+
+---
+
+## ✍️ Manual Daily Entry (Local JSON/CSV)
+
+Run from project root:
+
+```bash
+python scripts/daily-check.py --name mylog
+```
+
+✅ Output:
+
+```
+data/mylog.json
+data/mylog.csv
+```
+
+---
+
+## 🐘 Insert into Local PostgreSQL
+
+If you're using Minikube-local DB from `k8s/postgres-moodtracker`:
+
+```python
+# Edit inside daily-check-k8s.py
+host="localhost"  # or pod URL if inside k8s
+dbname="moodtracker"
+user="mooduser"
+password="moodpass"
+```
+
+Run:
+
+```bash
+python scripts/daily-check-k8s.py --name mylog
+```
+
+---
+
+## ☁️ Insert into AWS RDS (via SSM Tunnel Pod)
+
+If the SSM tunnel is running in Kubernetes:
+
+Use host **inside Kubernetes**:
+
+```
+postgres-rds.default.svc.cluster.local
+```
+
+From Kubernetes pod:
+
+```bash
+kubectl run -it psql --image=postgres --restart=Never \
+  -- psql -h postgres-rds.default.svc.cluster.local -U <user> -d postgres
+```
+
+From Python:
+
+```python
+host="postgres-rds.default.svc.cluster.local"
+port=5432
+```
+
+---
+
+## 🔧 Generate Fake Historical Data
+
+```bash
+python scripts/generate-fake-entry-k8s.py
+```
+
+* Fills DB starting from year 2000 to today
+* Useful for dashboards & Grafana testing
+
+---
+
+## 📊 Use Grafana Locally
+
+You can use:
+
+### Option A — Local Grafana in Kubernetes
+
+```bash
+kubectl port-forward svc/grafana 3000:3000
+```
+
+Access [http://localhost:3000](http://localhost:3000) (admin/admin)
+
+Add PostgreSQL datasource:
+
+```
+Host: postgres-rds.default.svc.cluster.local:5432
+Database: postgres
+User: <your user>
+SSL Mode: require
+```
+
+---
+
+### Option B — Grafana with Docker Compose
+
+Use the full stack (Grafana + Postgres + script runner) via Docker — see root `docker-compose.yml`.
+
+---
+
+✅ Next: see **[SSM Tunnel Details](tunnel-ssm.md)**.
+
+```
+
+```
+

@@ -1,0 +1,102 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  labels: { app: postgres }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: postgres }
+  template:
+    metadata:
+      labels: { app: postgres }
+    spec:
+      # Volume partagé entre initContainer et Postgres
+      volumes:
+        - name: workdir
+          emptyDir: {}
+        - name: data
+          persistentVolumeClaim:
+            claimName: postgres-pvc
+
+      # 1) initContainer: fetch secret depuis AWS SM et écrit le mot de passe
+      initContainers:
+        - name: fetch-secret
+          image: amazon/aws-cli:2.16.3
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: AWS_REGION
+              value: {{ .Values.aws.region | quote }}
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: aws-creds
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: aws-creds
+                  key: AWS_SECRET_ACCESS_KEY
+            - name: AWS_SESSION_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: aws-creds
+                  key: AWS_SESSION_TOKEN
+            - name: SECRET_NAME
+              value: {{ .Values.aws.secretName | quote }}
+          command: ["/bin/sh","-c"]
+          args:
+            - |
+              set -e
+              echo "🔐 Fetching password from AWS Secrets Manager: $SECRET_NAME (region=$AWS_REGION)"
+              # Récupère la valeur brute (secret_string)
+              PASS="$(aws secretsmanager get-secret-value \
+                --region "$AWS_REGION" \
+                --secret-id "$SECRET_NAME" \
+                --query 'SecretString' --output text)"
+              # Si le secret est un JSON { "password": "xxx" }, extraire la clé:
+              if echo "$PASS" | grep -q '{'; then
+                PASS="$(echo "$PASS" | python3 -c "import sys,json; print(json.load(sys.stdin).get('password',''))")"
+              fi
+              if [ -z "$PASS" ]; then
+                echo "❌ Empty password fetched from Secrets Manager"; exit 1
+              fi
+              umask 077
+              echo -n "$PASS" > /work/dbpass
+              echo "✅ Password written to /work/dbpass"
+          volumeMounts:
+            - name: workdir
+              mountPath: /work
+
+      # 2) Conteneur Postgres
+      containers:
+        - name: postgres
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - containerPort: {{ .Values.postgres.port }}
+          env:
+            - name: POSTGRES_DB
+              value: {{ .Values.postgres.db | quote }}
+            - name: POSTGRES_USER
+              value: {{ .Values.postgres.user | quote }}
+            - name: POSTGRES_PASSWORD_FILE     # <- pas de secret en clair
+              value: /work/dbpass
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: workdir
+              mountPath: /work
+          readinessProbe:
+            tcpSocket:
+              port: {{ .Values.postgres.port }}
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 60
+          livenessProbe:
+            tcpSocket:
+              port: {{ .Values.postgres.port }}
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 6
+

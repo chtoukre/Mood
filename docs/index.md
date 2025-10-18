@@ -65,4 +65,5 @@ cd mood-tracker
 
 # Launch documentation preview
 mkdocs serve
+```
 

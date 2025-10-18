@@ -1,0 +1,18 @@
+PostgreSQL (Helm) deployed.
+
+Service:
+  postgres.default.svc.cluster.local:5432
+
+DB:
+  name: {{ .Values.postgres.db }}
+  user: {{ .Values.postgres.user }}
+  password: pulled from AWS Secrets Manager ({{ .Values.aws.secretName }})
+
+Check:
+  kubectl get pods -l app=postgres
+  kubectl logs deploy/postgres
+
+Connect:
+  kubectl run -it --rm psql --image=postgres:15 --restart=Never -- \
+    psql -h postgres -U {{ .Values.postgres.user }} -d {{ .Values.postgres.db }}
+
