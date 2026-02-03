@@ -377,11 +377,7 @@ Contributions are welcome!
 * Style: keep docs clear, code commented, and avoid committing secrets.
 * For docs site, edit files in `docs/` and update `mkdocs.yml` if needed.
 
----
 
-## License
-
-MIT (adjust if you prefer another license).
 
 ---
 
